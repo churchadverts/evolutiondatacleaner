@@ -1,13 +1,29 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import ws from 'ws'; // Add WebSocket import
 
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: '50mb' })); // Allow large history payloads
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// Update the client initialization with WebSocket configuration
+const supabase = createClient(
+    process.env.SUPABASE_URL, 
+    process.env.SUPABASE_SERVICE_KEY, 
+    {
+        auth: {
+            persistSession: false // Good practice for server-side scripts
+        },
+        global: {
+            headers: { 'x-my-custom-header': 'heysasa-cleaner' }
+        },
+        realtime: {
+            websocket: ws // This satisfies the Node 20 requirement
+        }
+    }
+);
 
 app.post('/webhook/evolution', async (req, res) => {
     // 1. Extract Business ID from the Webhook URL Query
