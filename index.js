@@ -1,23 +1,22 @@
+import { WebSocket } from 'ws';
+globalThis.WebSocket = WebSocket; // This forces it into the global scope for Node 20
+
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
-import WebSocket from 'ws'; // Use capitalized 'WebSocket' to avoid naming conflicts
 
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// Initialize Supabase with the WebSocket transport for Node 20 compatibility
+// Now we can initialize Supabase normally
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     {
         auth: {
             persistSession: false
-        },
-        realtime: {
-            websocket: WebSocket // This is the key fix
         }
     }
 );
@@ -30,7 +29,7 @@ app.post('/webhook/evolution', async (req, res) => {
         return res.status(400).send("Missing business_id in webhook URL");
     }
 
-    // Always respond 200 immediately to the sender
+    // Always respond 200 immediately to Evolution API
     res.status(200).send("OK");
 
     if (eventType === 'messaging-history.set') {
