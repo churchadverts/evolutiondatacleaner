@@ -243,6 +243,52 @@ async function cancelPendingFollowUps(contactId) {
     }
 }
 
+/**
+ * Processes consent responses (STOP / YES) from inbound messages.
+ * Detects patterns in multiple languages and updates contact consent status.
+ */
+async function processConsentResponse(contactId, contentText) {
+    const text = contentText?.trim().toLowerCase() || '';
+
+    const isStop = /\bstop\b|hapana|usiteme|acha|unsubscribe|opt.?out/i.test(text);
+    const isYes  = /\byes\b|\bndio\b|\bok\b|\bsawa\b|\bokay\b|subscribe|nipe|tuma/i.test(text);
+
+    if (isStop) {
+        await supabase.from('contacts').update({
+            do_not_contact:        true,
+            follow_up_opted_in:    false,
+            follow_up_opted_out_at: new Date().toISOString()
+        }).eq('id', contactId);
+
+        // Kill every pending follow-up for this contact — permanent
+        await supabase.from('follow_up_queue').update({
+            status:      'cancelled',
+            skip_reason: 'contact_opted_out'
+        }).eq('contact_id', contactId).eq('status', 'pending');
+
+        console.log(`  [Consent] STOP received — contact ${contactId} permanently removed`);
+    }
+
+    if (isYes) {
+        const { data: contact } = await supabase
+            .from('contacts')
+            .select('consent_message_sent_at, follow_up_opted_in')
+            .eq('id', contactId)
+            .single();
+
+        // Only process YES if we actually sent a consent message to them
+        if (contact?.consent_message_sent_at && !contact?.follow_up_opted_in) {
+            await supabase.from('contacts').update({
+                follow_up_opted_in:    true,
+                follow_up_opted_in_at: new Date().toISOString()
+            }).eq('id', contactId);
+
+            console.log(`  [Consent] YES received — contact ${contactId} opted in`);
+            // Phase 4 will pick this up and schedule Step 1
+        }
+    }
+}
+
 // ==========================================
 // 4. HISTORY SYNC (unchanged from Phase 2)
 // ==========================================
@@ -479,6 +525,9 @@ async function processLiveMessage(payload, businessId) {
             if (!isFromMe) {
                 await updateLeadStateOnReply(contactId, contact.lead_state);
                 await cancelPendingFollowUps(contactId);
+
+                // ── Consent response detection ───────────────────
+                await processConsentResponse(contactId, content.text);
 
                 // AI routing goes here in Phase 4
                 // For now: message is in the DB, state is updated, queue is cleared
