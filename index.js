@@ -130,7 +130,7 @@ async function getOrCreateContact(businessId, jid, pushName) {
     const { data: existing } = await supabase
         .from('contacts')
         .select('id, lead_state, name')
-        .eq('business_id', businessId)
+        .eq('sasa_business_id', businessId)
         .eq('social_platform', 'whatsapp')
         .eq('social_id', jid)
         .maybeSingle();
@@ -149,7 +149,7 @@ async function getOrCreateContact(businessId, jid, pushName) {
     const { data: created, error } = await supabase
         .from('contacts')
         .insert({
-            business_id:     businessId,
+            sasa_business_id: businessId,
             social_platform: 'whatsapp',
             social_id:       jid,
             name:            pushName || 'Unknown',
@@ -174,7 +174,7 @@ async function getOrCreateConversation(businessId, contactId, jid) {
     const { data: existing } = await supabase
         .from('conversations')
         .select('id')
-        .eq('business_id', businessId)
+        .eq('sasa_business_id', businessId)
         .eq('contact_id', contactId)
         .maybeSingle();
 
@@ -183,7 +183,7 @@ async function getOrCreateConversation(businessId, contactId, jid) {
     const { data: created, error } = await supabase
         .from('conversations')
         .insert({
-            business_id:  businessId,
+            sasa_business_id: businessId,
             contact_id:   contactId,
             external_id:  jid,
             channel:      'whatsapp',
@@ -304,7 +304,7 @@ async function processHistorySync(payload, businessId) {
     // ── Contacts ─────────────────────────────────────────────────
     const validContacts    = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
     const contactPayloads  = validContacts.map(c => ({
-        business_id:     businessId,
+        sasa_business_id: businessId,
         social_platform: 'whatsapp',
         social_id:       c.id,
         name:            c.name || c.notify || c.verifiedName || 'Unknown',
@@ -317,7 +317,7 @@ async function processHistorySync(payload, businessId) {
         const { data: inserted, error } = await supabase
             .from('contacts')
             .upsert(contactPayloads, {
-                onConflict:       'business_id, social_platform, social_id',
+                onConflict:       'sasa_business_id, social_platform, social_id',
                 ignoreDuplicates: false
             })
             .select('id, social_id');
@@ -332,7 +332,7 @@ async function processHistorySync(payload, businessId) {
     const validChats          = chats.filter(c => c.id && !isGroupOrBroadcast(c.id));
     const conversationPayloads = validChats
         .map(chat => ({
-            business_id:  businessId,
+            sasa_business_id: businessId,
             contact_id:   contactMap[chat.id],
             external_id:  chat.id,
             channel:      'whatsapp',
@@ -348,7 +348,7 @@ async function processHistorySync(payload, businessId) {
     if (conversationPayloads.length > 0) {
         const { data: inserted, error } = await supabase
             .from('conversations')
-            .upsert(conversationPayloads, { onConflict: 'business_id, contact_id' })
+            .upsert(conversationPayloads, { onConflict: 'sasa_business_id, contact_id' })
             .select('id, external_id');
 
         if (error) throw new Error(`Conversations upsert: ${error.message}`);
@@ -393,7 +393,7 @@ async function processHistorySync(payload, businessId) {
 
         messagePayloads.push({
             whatsapp_message_id: msg.key.id,
-            business_id:         businessId,
+            sasa_business_id:    businessId,
             contact_id:          contactId,
             conversation_id:     conversationId,
             direction:           isFromMe ? 'out' : 'in',
@@ -487,7 +487,7 @@ async function processLiveMessage(payload, businessId) {
                 .from('messages')
                 .upsert({
                     whatsapp_message_id: msg.key.id,
-                    business_id:         businessId,
+                    sasa_business_id:    businessId,
                     contact_id:          contactId,
                     conversation_id:     conversationId,
                     direction:           isFromMe ? 'out' : 'in',
@@ -568,7 +568,7 @@ async function processConnectionUpdate(payload, businessId) {
             const { data: biz } = await supabase
                 .from('businesses')
                 .select('ai_config')
-                .eq('business_id', businessId)
+                .eq('sasa_business_id', businessId)
                 .single();
 
             const updatedConfig = {
@@ -580,7 +580,7 @@ async function processConnectionUpdate(payload, businessId) {
             await supabase
                 .from('businesses')
                 .update({ ai_config: updatedConfig })
-                .eq('business_id', businessId);
+                .eq('sasa_business_id', businessId);
 
         } catch (e) {
             console.error(`  [Connection] Failed to update ai_config: ${e.message}`);
@@ -594,7 +594,7 @@ async function processConnectionUpdate(payload, businessId) {
             const { data: biz } = await supabase
                 .from('businesses')
                 .select('ai_config')
-                .eq('business_id', businessId)
+                .eq('sasa_business_id', businessId)
                 .single();
 
             const updatedConfig = {
@@ -606,7 +606,7 @@ async function processConnectionUpdate(payload, businessId) {
             await supabase
                 .from('businesses')
                 .update({ ai_config: updatedConfig })
-                .eq('business_id', businessId);
+                .eq('sasa_business_id', businessId);
 
         } catch (e) {
             console.error(`  [Connection] Failed to update ai_config: ${e.message}`);
