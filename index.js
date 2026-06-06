@@ -20,6 +20,7 @@ const EVOLUTION_URL       = process.env.EVOLUTION_URL       || 'http://129.213.3
 const EVOLUTION_API_KEY   = process.env.EVOLUTION_API_KEY   || 'mysupersecretapikey123';
 const PERSONA_SERVICE_URL = process.env.PERSONA_SERVICE_URL || 'http://129.213.33.173:8002';
 const HISTORY_DAYS        = parseInt(process.env.HISTORY_DAYS || '90');
+const ENRICHMENT_WORKER_URL = process.env.ENRICHMENT_WORKER_URL || 'http://localhost:3001';
 
 // ==========================================
 // 1. BILLING CONFIG
@@ -860,7 +861,35 @@ async function processLiveMessage(payload, businessId) {
 }
 
 // ==========================================
-// 11. CONNECTION UPDATE HANDLER
+// 11. MESSAGE STATUS UPDATE HANDLER
+// ==========================================
+// Routes status updates (delivery/read receipts) to enrichment worker.
+
+async function processMessageStatusUpdate(payload, businessId) {
+    try {
+        console.log(`  [StatusUpdate] Forwarding status update to enrichment worker for ${businessId}`);
+        
+        const response = await fetch(`${ENRICHMENT_WORKER_URL}/status-update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                business_id: businessId,
+                ...payload
+            })
+        });
+
+        if (!response.ok) {
+            console.warn(`  [StatusUpdate] Enrichment worker returned ${response.status}`);
+        } else {
+            console.log(`  [StatusUpdate] ✓ Forwarded to enrichment worker`);
+        }
+    } catch (e) {
+        console.error(`  [StatusUpdate] Failed to forward: ${e.message}`);
+    }
+}
+
+// ==========================================
+// 12. CONNECTION UPDATE HANDLER
 // ==========================================
 
 async function processConnectionUpdate(payload, businessId) {
@@ -949,7 +978,7 @@ async function processConnectionUpdate(payload, businessId) {
 }
 
 // ==========================================
-// 12. BOT BUILD TRIGGER
+// 13. BOT BUILD TRIGGER
 // ==========================================
 // Calls System 1 (persona pipeline) after lead activation.
 // Writes progress to onboarding so frontend can show "Creating your bot..."
@@ -993,7 +1022,7 @@ async function triggerBotBuild(businessId) {
 }
 
 // ==========================================
-// 13. EXPRESS ROUTES
+// 14. EXPRESS ROUTES
 // ==========================================
 
 // ── Webhook from Evolution Go ─────────────────────────────────
@@ -1017,6 +1046,10 @@ app.post('/webhook/evolution', async (req, res) => {
 
             case 'messages.upsert':
                 await processLiveMessage(req.body, businessId);
+                break;
+
+            case 'messages.update':
+                await processMessageStatusUpdate(req.body, businessId);
                 break;
 
             case 'connection.update':
