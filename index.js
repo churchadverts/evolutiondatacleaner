@@ -16,28 +16,31 @@ const supabase = createClient(
     { auth: { persistSession: false } }
 );
 
-const EVOLUTION_URL         = process.env.EVOLUTION_URL         || 'http://129.213.33.173:8080';
-const EVOLUTION_API_KEY     = process.env.EVOLUTION_API_KEY     || 'mysupersecretapikey123';
-const PERSONA_SERVICE_URL   = process.env.PERSONA_SERVICE_URL   || 'http://129.213.33.173:8002';
-const HISTORY_DAYS          = parseInt(process.env.HISTORY_DAYS || '90');
-const ENRICHMENT_WORKER_URL = process.env.ENRICHMENT_WORKER_URL || 'http://localhost:3001';
+const EVOLUTION_URL          = process.env.EVOLUTION_URL          || 'http://localhost:8080';
+const EVOLUTION_API_KEY      = process.env.EVOLUTION_API_KEY      || '';
+const INSTRUCTIONS_URL       = process.env.INSTRUCTIONS_URL       || 'http://localhost:8002';  // system1 / persona pipeline
+const PRODUCTS_HANDLER_URL   = process.env.PRODUCTS_HANDLER_URL   || 'http://localhost:3002';  // image harvest + vision
+const LEADS_ENRICHMENT_URL   = process.env.LEADS_ENRICHMENT_URL   || 'http://localhost:3003';  // lead data enrichment
+const ENRICHMENT_WORKER_URL  = process.env.ENRICHMENT_WORKER_URL  || 'http://localhost:3001';  // existing status-update worker
+const HISTORY_DAYS           = parseInt(process.env.HISTORY_DAYS  || '90');
 
 // Auto-activation constants — overridable via billing config
-const AUTO_ACTIVATE_LEADS    = 30;
-const AUTO_APPROVE_PRODUCTS  = 30;
+const AUTO_ACTIVATE_LEADS   = 30;
+const AUTO_APPROVE_PRODUCTS = 30;
 
 // ============================================================
 // SECTION 1 — BILLING CONFIG
 // ============================================================
 // Keys consumed from followup_billing_config:
-//   lead_ingestion_min_kes       — KES per activated lead     (default 0.75)
-//   usd_to_kes_rate              — exchange rate              (default 130)
-//   bot_build_cost_multiplier    — multiplier on OpenAI cost  (default 3)
-//   bot_build_min_balance_usd    — min balance for bot build  (default 0.10)
+//   lead_ingestion_min_kes     — KES per activated lead (default 0.75)
+//   usd_to_kes_rate            — exchange rate          (default 130)
+//
+// Note: bot_build_cost_multiplier and bot_build_min_balance_usd
+// have been moved to instructions-generator — they only apply there.
 // ============================================================
 
-let _billingConfig      = null;
-let _billingConfigAt    = 0;
+let _billingConfig   = null;
+let _billingConfigAt = 0;
 
 async function getBillingConfig() {
     if (_billingConfig && (Date.now() - _billingConfigAt) < 5 * 60 * 1000) return _billingConfig;
@@ -64,12 +67,15 @@ async function getBillingValue(key, defaultValue) {
 
 /**
  * Deduct KES from a business balance.
- * Converts KES → USD using the config rate then writes to business_balances.
+ * Converts KES → USD using the config rate, writes to business_balances.
  * Returns { ok, reason?, charged_kes?, charged_usd?, new_balance_usd? }
+ *
+ * This is the ONLY place in the cleaner that touches money.
+ * Top-ups go through the billing edge function — never here.
  */
 async function chargeKes(businessId, amountKes, description) {
     try {
-        const rate     = await getBillingValue('usd_to_kes_rate', 130);
+        const rate      = await getBillingValue('usd_to_kes_rate', 130);
         const amountUsd = amountKes / rate;
 
         const { data: balance } = await supabase
@@ -102,32 +108,23 @@ async function chargeKes(businessId, amountKes, description) {
 // SECTION 2 — ONBOARDING PROGRESS WRITER
 // ============================================================
 // business_onboarding is the single source of truth the frontend polls.
+// This service owns ALL writes to sync_status.stage.
+// Workers write only their own count columns (e.g. products_auto_approved_count)
+// via direct Supabase calls — they never write sync_status.stage.
 //
-// Fields written by this service:
-//   sync_status                  — { stage, message, ...extras } — frontend reads stage to drive UI
-//   leads_total_found            — raw count from pre-scan, written FIRST so slider renders immediately
-//   leads_auto_activated_count   — how many leads were auto-activated (gate: only written once)
-//   leads_auto_activated_at      — ISO timestamp — idempotency gate for auto-activation
-//   leads_user_activated_count   — cumulative user-chosen activations (delta applied on /leads/activate)
-//   leads_processed              — total activated (auto + user), used by follow-up engine
-//   products_auto_approved_count — how many images were auto-approved in first run
-//   products_pending_approval    — images still waiting for user approval
-//   products_seeded              — true once System 1 has been handed approved images
-//   whatsapp_connected           — true on connection.update open
-//   current_step                 — drives the onboarding step indicator on the frontend
-//
-// Frontend stage → UI mapping:
-//   history_received             → "Syncing your WhatsApp..." spinner
-//   awaiting_lead_activation     → slider visible, pre-filled, total_found shown
-//   auto_activating              → "Setting up your first 30 leads..." inline notice
-//   insufficient_funds_auto      → "Top up to activate leads" CTA
-//   leads_activated              → confirmation row under slider
-//   bot_building                 → bot build progress card
-//   bot_build_failed             → error card with retry CTA
-//   products_discovered          → product approval CTA with pending count
-//   products_auto_approved       → "X products being analysed" notice
-//   connected                    → WhatsApp connected banner
-//   disconnected                 → reconnect CTA
+// Stage ownership:
+//   history_received           ← processHistorySync (phase 1)
+//   awaiting_lead_activation   ← processHistorySync (phase 1, after pre-scan)
+//   auto_activating            ← autoActivateLeads
+//   insufficient_funds_auto    ← autoActivateLeads (charge failed)
+//   leads_activated            ← autoActivateLeads (success) / /leads/activate
+//   bot_building               ← triggerInstructionsGenerator
+//   bot_build_failed           ← triggerInstructionsGenerator (on error)
+//   products_auto_approved     ← stageAndAutoApproveProductImages (first run)
+//   products_discovered        ← stageAndAutoApproveProductImages (pending only)
+//   products_approved          ← /products/approve-discovery
+//   connected                  ← processConnectionUpdate
+//   disconnected               ← processConnectionUpdate
 // ============================================================
 
 async function writeOnboardingProgress(businessId, fields) {
@@ -229,7 +226,7 @@ function extractMessageContent(msg) {
 // Extracts:
 //   - count of unique non-group inbound JIDs  → leads_total_found
 //   - count of unique outbound image JIDs      → products raw count
-// This count is written to onboarding immediately so the frontend
+// Count is written to onboarding immediately so the frontend
 // can render the slider before the full sync completes.
 // ============================================================
 
@@ -237,23 +234,19 @@ function preScanPayload(payload) {
     const messages = payload.data?.messages || [];
     const contacts = payload.data?.contacts || [];
 
-    const cutoffTs    = Math.floor(Date.now() / 1000) - (HISTORY_DAYS * 24 * 60 * 60);
-    const uniqueJids  = new Set();
+    const cutoffTs               = Math.floor(Date.now() / 1000) - (HISTORY_DAYS * 24 * 60 * 60);
+    const uniqueJids             = new Set();
     const outboundImgThumbHashes = new Set();
-    let outboundImageCount = 0;
+    let outboundImageCount       = 0;
 
     for (const msg of messages) {
         const jid = msg.key?.remoteJid;
-        if (!jid || isGroupOrBroadcast(jid)) continue;
-        if ((msg.messageTimestamp || 0) < cutoffTs) continue;
-        if (msg.messageStubType) continue;
+        if (!jid || isGroupOrBroadcast(jid))          continue;
+        if ((msg.messageTimestamp || 0) < cutoffTs)   continue;
+        if (msg.messageStubType)                       continue;
 
-        // Count unique inbound contacts (leads)
-        if (!msg.key.fromMe) {
-            uniqueJids.add(jid);
-        }
+        if (!msg.key.fromMe) uniqueJids.add(jid);
 
-        // Deduplicate outbound images by thumbnail hash
         if (msg.key.fromMe && msg.message?.imageMessage) {
             const thumb = msg.message.imageMessage.jpegThumbnail;
             if (thumb) {
@@ -268,17 +261,10 @@ function preScanPayload(payload) {
         }
     }
 
-    // Fall back to contacts array length if messages array is sparse
-    // (Evolution sometimes sends contacts without full message history)
     const contactCount = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id)).length;
     const leadsFound   = Math.max(uniqueJids.size, contactCount);
 
-    return {
-        leadsFound,
-        uniqueJids,
-        outboundImageCount,
-        outboundImgThumbHashes  // pass through so message loop reuses same set
-    };
+    return { leadsFound, uniqueJids, outboundImageCount, outboundImgThumbHashes };
 }
 
 // ============================================================
@@ -306,18 +292,18 @@ async function fetchAndSaveWhatsAppProfile(businessId, instanceToken, jid) {
             .eq('business_id', businessId)
             .single();
 
-        const updates = {};
+        const updates          = {};
         const namePlaceholders = ['', 'processing...', 'my business', null, undefined];
         if (namePlaceholders.includes((existing?.name || '').toLowerCase())) {
             const waName = data.name || data.pushName || data.verifiedName;
             if (waName) updates.name = waName;
         }
-        if (data.picture || data.profilePictureUrl)  updates.profile_picture_url = data.picture || data.profilePictureUrl;
-        if (!existing?.address     && data.address)  updates.address    = data.address;
+        if (data.picture || data.profilePictureUrl) updates.profile_picture_url = data.picture || data.profilePictureUrl;
+        if (!existing?.address     && data.address)     updates.address     = data.address;
         if (!existing?.description && data.description) updates.description = data.description;
-        if (!existing?.owner_email && data.email)    updates.owner_email = data.email;
-        if (!existing?.website_url && data.website)  updates.website_url = data.website;
-        if (!existing?.phone       && data.phone)    updates.phone       = data.phone;
+        if (!existing?.owner_email && data.email)       updates.owner_email = data.email;
+        if (!existing?.website_url && data.website)     updates.website_url = data.website;
+        if (!existing?.phone       && data.phone)       updates.phone       = data.phone;
 
         if (Object.keys(updates).length > 0) {
             await supabase.from('businesses').update(updates).eq('business_id', businessId);
@@ -346,8 +332,8 @@ function extractAdAttribution(msg) {
     if (!adReply) return null;
 
     let adPlatform = 'meta';
-    const src = (adReply.sourceUrl || '').toLowerCase();
-    if (src.includes('instagram'))                       adPlatform = 'instagram';
+    const src      = (adReply.sourceUrl || '').toLowerCase();
+    if (src.includes('instagram'))                            adPlatform = 'instagram';
     else if (src.includes('facebook') || src.includes('fb.com')) adPlatform = 'facebook';
 
     return {
@@ -437,18 +423,18 @@ function extractProductInterests(adData, firstMessageText) {
     if (!sources.trim()) return interests;
 
     const signals = [
-        { pattern: /solar|panel|inverter|battery/,      tag: 'solar_energy'       },
-        { pattern: /rent|apartment|house|plot|land/,    tag: 'real_estate'        },
-        { pattern: /car|vehicle|truck|motorbike/,       tag: 'automotive'         },
-        { pattern: /phone|laptop|computer|tablet/,      tag: 'electronics'        },
-        { pattern: /insurance|cover|policy|bima/,       tag: 'insurance'          },
-        { pattern: /loan|credit|mkopo|finance/,         tag: 'financial_services' },
-        { pattern: /school|college|course|training/,    tag: 'education'          },
-        { pattern: /clinic|hospital|doctor|dawa/,       tag: 'healthcare'         },
-        { pattern: /food|catering|cake|meal/,           tag: 'food_beverage'      },
-        { pattern: /clothes|dress|fashion|shoes/,       tag: 'fashion_apparel'    },
-        { pattern: /salon|barber|beauty|spa|nails/,     tag: 'beauty_wellness'    },
-        { pattern: /software|app|website|system/,       tag: 'software_tech'      },
+        { pattern: /solar|panel|inverter|battery/,   tag: 'solar_energy'       },
+        { pattern: /rent|apartment|house|plot|land/,  tag: 'real_estate'        },
+        { pattern: /car|vehicle|truck|motorbike/,     tag: 'automotive'         },
+        { pattern: /phone|laptop|computer|tablet/,    tag: 'electronics'        },
+        { pattern: /insurance|cover|policy|bima/,     tag: 'insurance'          },
+        { pattern: /loan|credit|mkopo|finance/,       tag: 'financial_services' },
+        { pattern: /school|college|course|training/,  tag: 'education'          },
+        { pattern: /clinic|hospital|doctor|dawa/,     tag: 'healthcare'         },
+        { pattern: /food|catering|cake|meal/,         tag: 'food_beverage'      },
+        { pattern: /clothes|dress|fashion|shoes/,     tag: 'fashion_apparel'    },
+        { pattern: /salon|barber|beauty|spa|nails/,   tag: 'beauty_wellness'    },
+        { pattern: /software|app|website|system/,     tag: 'software_tech'      },
     ];
 
     for (const { pattern, tag } of signals) {
@@ -577,14 +563,12 @@ async function processConsentResponse(contactId, contentText) {
 // ============================================================
 // SECTION 9 — AUTO-ACTIVATION (first 30 leads)
 // ============================================================
-// Called after contacts are upserted into DB.
 // Idempotency gate: reads leads_auto_activated_at from onboarding.
-// If already set → skip entirely (handles Evolution resend).
-// Charges KES, writes onboarding fields, triggers bot build.
+// Charges KES, writes onboarding stage, then fires InstructionsGenerator.
+// Does NOT touch lead enrichment — that's LeadsEnrichment's job.
 // ============================================================
 
 async function autoActivateLeads(businessId, onboardingRow) {
-    // ── Idempotency gate ─────────────────────────────────────
     if (onboardingRow.leads_auto_activated_at) {
         console.log(`  [AutoActivate] Already activated for ${businessId} — skipping`);
         return { skipped: true };
@@ -615,7 +599,7 @@ async function autoActivateLeads(businessId, onboardingRow) {
         return { ok: false, reason: charge.reason };
     }
 
-    // Write auto-activation record — this is the idempotency lock
+    // Write idempotency lock first
     await writeOnboardingProgress(businessId, {
         leads_auto_activated_count: AUTO_ACTIVATE_LEADS,
         leads_auto_activated_at:    new Date().toISOString(),
@@ -633,8 +617,16 @@ async function autoActivateLeads(businessId, onboardingRow) {
 
     console.log(`  [AutoActivate] ✓ ${AUTO_ACTIVATE_LEADS} leads activated, charged ${totalKes} KES`);
 
-    // Trigger bot build non-blocking
-    triggerBotBuild(businessId).catch(e => console.error('[AutoActivate] Bot build error:', e.message));
+    // Fire InstructionsGenerator (bot build) — non-blocking
+    triggerInstructionsGenerator(businessId).catch(e =>
+        console.error('[AutoActivate] InstructionsGenerator trigger error:', e.message)
+    );
+
+    // Fire LeadsEnrichment — non-blocking
+    // Enrichment runs independently; it doesn't block the onboarding flow
+    triggerLeadsEnrichment(businessId).catch(e =>
+        console.error('[AutoActivate] LeadsEnrichment trigger error:', e.message)
+    );
 
     return { ok: true, activated: AUTO_ACTIVATE_LEADS, charged_kes: totalKes, charged_usd: charge.charged_usd };
 }
@@ -642,11 +634,11 @@ async function autoActivateLeads(businessId, onboardingRow) {
 // ============================================================
 // SECTION 10 — HISTORY SYNC
 // ============================================================
-// Phase 1 (pre-scan)  — O(n), no DB — writes leads_total_found immediately
+// Phase 1 (pre-scan)   — O(n), no DB — writes leads_total_found immediately
 // Phase 2 (DB upserts) — contacts, conversations, messages in bulk
-// Phase 3 (classify)  — ad attribution + lead type per contact
-// Phase 4 (auto-activate) — charge + trigger bot build for first 30
-// Phase 5 (products)  — stage + auto-approve first 30 product images
+// Phase 3 (classify)   — ad attribution + lead type per contact
+// Phase 4 (activate)   — charge + fire InstructionsGenerator + LeadsEnrichment
+// Phase 5 (products)   — stage images + fire ProductsHandler
 // ============================================================
 
 async function processHistorySync(payload, businessId, sasaBusinessId) {
@@ -657,7 +649,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
     const stats = { contacts: 0, conversations: 0, messages: 0, skipped: 0, ad_leads: 0 };
     console.log(`  [History] Raw — contacts:${contacts.length} chats:${chats.length} messages:${messages.length}`);
 
-    // ── Read onboarding once — used for all idempotency gates ──
     const onboardingRow = await getOnboardingRow(businessId);
 
     // ── Phase 1: Pre-scan — write count before any DB work ─────
@@ -667,7 +658,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 
     const preScan = preScanPayload(payload);
 
-    // Write leads_total_found NOW so the slider renders immediately
     await writeOnboardingProgress(businessId, {
         leads_total_found: preScan.leadsFound,
         sync_status: {
@@ -682,8 +672,8 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
     console.log(`  [History] Pre-scan: ${preScan.leadsFound} leads, ${preScan.outboundImageCount} product images`);
 
     // ── Phase 2: Contacts upsert ────────────────────────────────
-    const validContacts    = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
-    const contactPayloads  = validContacts.map(c => ({
+    const validContacts   = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
+    const contactPayloads = validContacts.map(c => ({
         business_id:     businessId,
         social_platform: 'whatsapp',
         social_id:       c.id,
@@ -743,7 +733,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
     const messagePayloads = [];
     const contactFirstMsg = {};
     const outboundImages  = [];
-    // Re-use the same thumbnail hash set from pre-scan for deduplication
     const seenThumbHashes = preScan.outboundImgThumbHashes;
 
     for (const msg of messages) {
@@ -774,19 +763,13 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
             }
         }
 
-        // Collect outbound images — dedup using the pre-scan hash set (no double counting)
         if (isFromMe && content.type === 'image') {
             const thumb = msg.message?.imageMessage?.jpegThumbnail;
             if (thumb) {
                 const key = typeof thumb === 'string'
                     ? thumb.substring(0, 50)
                     : JSON.stringify(thumb).substring(0, 50);
-                if (seenThumbHashes.has(key)) {
-                    // Already counted in pre-scan — collect for staging
-                    outboundImages.push(msg);
-                }
-                // Note: seenThumbHashes was built during pre-scan so this
-                // naturally includes only unique images
+                if (seenThumbHashes.has(key)) outboundImages.push(msg);
             }
         }
 
@@ -807,7 +790,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         });
     }
 
-    // Upsert messages in chunks of 100
     for (let i = 0; i < messagePayloads.length; i += 100) {
         const chunk = messagePayloads.slice(i, i + 100);
         const { error } = await supabase
@@ -824,9 +806,9 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 
     for (const [contactId, { msg, content }] of Object.entries(contactFirstMsg)) {
         try {
-            const adData       = extractAdAttribution(msg);
-            const leadType     = classifyLeadType(content.text, !!adData);
-            const interests    = extractProductInterests(adData, content.text);
+            const adData      = extractAdAttribution(msg);
+            const leadType    = classifyLeadType(content.text, !!adData);
+            const interests   = extractProductInterests(adData, content.text);
             const contactUpdate = { lead_type: leadType };
             if (interests.length > 0) contactUpdate.product_interests = interests;
             await supabase.from('contacts').update(contactUpdate).eq('id', contactId);
@@ -845,11 +827,11 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         await supabase.from('conversations').update(fields).eq('id', convId);
     }
 
-    // ── Phase 4: Auto-activate first 30 leads ──────────────────
-    // Idempotency handled inside autoActivateLeads()
+    // ── Phase 4: Auto-activate + fire workers ───────────────────
+    // autoActivateLeads internally fires InstructionsGenerator + LeadsEnrichment
     await autoActivateLeads(businessId, onboardingRow);
 
-    // ── Phase 5: Stage + auto-approve first 30 product images ──
+    // ── Phase 5: Stage product images + fire ProductsHandler ────
     if (outboundImages.length > 0) {
         await stageAndAutoApproveProductImages(businessId, outboundImages, onboardingRow);
     }
@@ -859,21 +841,15 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 }
 
 // ============================================================
-// SECTION 11 — PRODUCT IMAGE STAGING + AUTO-APPROVAL
+// SECTION 11 — PRODUCT IMAGE STAGING
 // ============================================================
-// Replaces the old stageProductImagesForDiscovery().
-// Deduplication: thumbnail hash (pre-scan set already deduplicated;
-//   we do a second pass here against existing DB records to handle
-//   Evolution resends without double-inserting).
+// Responsibility: write product_image_staging rows and update onboarding counts.
+// Does NOT download images or call OpenAI — that's ProductsHandler's job.
 //
-// Idempotency gate: onboardingRow.products_auto_approved_count
-//   If > 0 → auto-approval already ran, stage any new ones as pending only.
+// After staging, fires ProductsHandler non-blocking with the list of
+// approved media_urls. ProductsHandler does the download → vision → products insert.
 //
-// First 30 unique images → status='approved', is_auto_approved=true
-// Remainder             → status='pending_approval'
-//
-// System 1 reads product_image_staging WHERE status='approved'
-// and processes them into the products table.
+// Idempotency gate: products_auto_approved_count > 0 means first run already happened.
 // ============================================================
 
 async function stageAndAutoApproveProductImages(businessId, imageMessages, onboardingRow) {
@@ -883,8 +859,6 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
 
         console.log(`  [Products] Staging ${imageMessages.length} unique images (first run: ${isFirstRun})`);
 
-        // Fetch existing media_urls already staged for this business
-        // to avoid re-inserting on Evolution resend
         const { data: existingStaged } = await supabase
             .from('product_image_staging')
             .select('media_url, status')
@@ -892,7 +866,6 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
 
         const existingUrls = new Set((existingStaged || []).map(r => r.media_url).filter(Boolean));
 
-        // Split into new vs already-staged
         const newImages = imageMessages.filter(msg => {
             const url = msg.message?.imageMessage?.url;
             return url && !existingUrls.has(url);
@@ -905,22 +878,18 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
             return;
         }
 
-        // On first run: first 30 get auto-approved, rest pending
-        // On subsequent runs: all new images go to pending (user approves manually)
         let autoApproveSlots = isFirstRun ? AUTO_APPROVE_PRODUCTS - alreadyAutoApproved : 0;
-        // Guard: never auto-approve more than the constant regardless of arithmetic
-        autoApproveSlots = Math.max(0, Math.min(autoApproveSlots, AUTO_APPROVE_PRODUCTS));
+        autoApproveSlots     = Math.max(0, Math.min(autoApproveSlots, AUTO_APPROVE_PRODUCTS));
 
         const toAutoApprove = newImages.slice(0, autoApproveSlots);
         const toPending     = newImages.slice(autoApproveSlots);
-
-        const now = new Date().toISOString();
+        const now           = new Date().toISOString();
 
         const buildPayload = (msg, status) => ({
             business_id:      businessId,
-            media_url:        msg.message?.imageMessage?.url        || null,
-            thumbnail:        msg.message?.imageMessage?.jpegThumbnail || null,
-            caption:          msg.message?.imageMessage?.caption    || null,
+            media_url:        msg.message?.imageMessage?.url             || null,
+            thumbnail:        msg.message?.imageMessage?.jpegThumbnail   || null,
+            caption:          msg.message?.imageMessage?.caption         || null,
             raw_payload:      msg,
             status,
             is_auto_approved: status === 'approved',
@@ -938,12 +907,11 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
                 .from('product_image_staging')
                 .upsert(stagingPayloads, {
                     onConflict:       'business_id, media_url',
-                    ignoreDuplicates: true   // never overwrite an approved record with pending
+                    ignoreDuplicates: true
                 });
             if (error) console.warn(`  [Products] Staging upsert warning: ${error.message}`);
         }
 
-        // Update onboarding with new counts
         const newAutoApproved    = alreadyAutoApproved + toAutoApprove.length;
         const totalPendingResult = await supabase
             .from('product_image_staging')
@@ -958,29 +926,39 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
         };
 
         if (isFirstRun && toAutoApprove.length > 0) {
-            // First run with auto-approvals → mark products_seeded so System 1 picks them up
             progressFields.products_seeded  = true;
             progressFields.products_done_at = now;
             await writeOnboardingProgress(businessId, {
                 ...progressFields,
                 sync_status: {
-                    stage:          'products_auto_approved',
-                    message:        `${toAutoApprove.length} product images sent for analysis automatically.` +
-                                    (pendingCount > 0 ? ` ${pendingCount} more waiting for your approval.` : ''),
-                    auto_approved:  toAutoApprove.length,
-                    pending:        pendingCount,
-                    updated_at:     now
+                    stage:         'products_auto_approved',
+                    message:       `${toAutoApprove.length} product images sent for analysis automatically.` +
+                                   (pendingCount > 0 ? ` ${pendingCount} more waiting for your approval.` : ''),
+                    auto_approved: toAutoApprove.length,
+                    pending:       pendingCount,
+                    updated_at:    now
                 }
             });
+
+            // Fire ProductsHandler for the approved batch — non-blocking
+            // Pass the approved media_urls so it doesn't need to re-query
+            const approvedUrls = toAutoApprove
+                .map(msg => msg.message?.imageMessage?.url)
+                .filter(Boolean);
+
+            triggerProductsHandler(businessId, approvedUrls).catch(e =>
+                console.error('[Products] ProductsHandler trigger error:', e.message)
+            );
+
         } else if (pendingCount > 0) {
             await writeOnboardingProgress(businessId, {
                 ...progressFields,
                 sync_status: {
-                    stage:          'products_discovered',
-                    message:        `${pendingCount} product images found. Approve them to add to your catalog.`,
-                    auto_approved:  newAutoApproved,
-                    pending:        pendingCount,
-                    updated_at:     now
+                    stage:         'products_discovered',
+                    message:       `${pendingCount} product images found. Approve them to add to your catalog.`,
+                    auto_approved: newAutoApproved,
+                    pending:       pendingCount,
+                    updated_at:    now
                 }
             });
         } else {
@@ -1000,9 +978,9 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
 
 async function processLiveMessage(payload, businessId) {
     let rawMessages = [];
-    if (Array.isArray(payload.data))    rawMessages = payload.data;
-    else if (payload.data?.key)         rawMessages = [payload.data];
-    else if (payload.data?.messages)    rawMessages = payload.data.messages;
+    if (Array.isArray(payload.data))  rawMessages = payload.data;
+    else if (payload.data?.key)       rawMessages = [payload.data];
+    else if (payload.data?.messages)  rawMessages = payload.data.messages;
     else { console.log('  [Live] No parseable messages'); return; }
 
     for (const msg of rawMessages) {
@@ -1091,11 +1069,8 @@ async function processMessageStatusUpdate(payload, businessId) {
             headers: { 'Content-Type': 'application/json' },
             body:    JSON.stringify({ business_id: businessId, ...payload })
         });
-        if (!response.ok) {
-            console.warn(`  [StatusUpdate] Enrichment worker returned ${response.status}`);
-        } else {
-            console.log(`  [StatusUpdate] ✓ Forwarded`);
-        }
+        if (!response.ok) console.warn(`  [StatusUpdate] Enrichment worker returned ${response.status}`);
+        else              console.log(`  [StatusUpdate] ✓ Forwarded`);
     } catch (e) {
         console.error(`  [StatusUpdate] Failed to forward: ${e.message}`);
     }
@@ -1106,8 +1081,8 @@ async function processMessageStatusUpdate(payload, businessId) {
 // ============================================================
 
 async function processConnectionUpdate(payload, businessId) {
-    const state         = payload.data?.state;
-    const statusReason  = payload.data?.statusReason;
+    const state        = payload.data?.state;
+    const statusReason = payload.data?.statusReason;
     const instanceToken = new URL(payload.webhookUrl || 'http://x').searchParams.get('sasa_business_id')
         || payload.sasa_business_id
         || null;
@@ -1185,10 +1160,18 @@ async function processConnectionUpdate(payload, businessId) {
 }
 
 // ============================================================
-// SECTION 15 — BOT BUILD TRIGGER
+// SECTION 15 — WORKER TRIGGERS
+// ============================================================
+// All three workers are fired non-blocking (fire-and-forget HTTP POST).
+// The cleaner does not await their completion — it just fires and moves on.
+// Each worker is responsible for its own error handling and status writes.
+//
+// InstructionsGenerator: builds persona pack (voice + context + customer analysis)
+// ProductsHandler:       downloads images, runs vision, inserts into products table
+// LeadsEnrichment:       enriches contacts with intent, quality score, lead type
 // ============================================================
 
-async function triggerBotBuild(businessId) {
+async function triggerInstructionsGenerator(businessId) {
     try {
         await writeSyncStatus(businessId, 'bot_building',
             'Building your AI bot... This takes 1–2 minutes. You can continue setup in the meantime.'
@@ -1198,17 +1181,17 @@ async function triggerBotBuild(businessId) {
             .update({ persona_pack_status: 'running' })
             .eq('business_id', businessId);
 
-        const res = await fetch(`${PERSONA_SERVICE_URL}/generate-persona`, {
+        const res = await fetch(`${INSTRUCTIONS_URL}/generate-persona`, {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
             body:    JSON.stringify({ business_id: businessId })
         });
 
         if (res.ok) {
-            console.log(`  [BotBuild] ✓ Persona pipeline triggered for ${businessId}`);
+            console.log(`  [Workers] ✓ InstructionsGenerator triggered for ${businessId}`);
         } else if (res.status === 402) {
             const body = await res.json();
-            console.warn(`  [BotBuild] Insufficient funds: ${body.message}`);
+            console.warn(`  [Workers] InstructionsGenerator insufficient funds: ${body.message}`);
             await writeSyncStatus(businessId, 'bot_build_failed',
                 'Insufficient credits to build AI bot. Please top up.'
             );
@@ -1216,7 +1199,7 @@ async function triggerBotBuild(businessId) {
                 .update({ persona_pack_status: 'insufficient_funds' })
                 .eq('business_id', businessId);
         } else {
-            console.error(`  [BotBuild] Persona service returned ${res.status}`);
+            console.error(`  [Workers] InstructionsGenerator returned ${res.status}`);
             await writeSyncStatus(businessId, 'bot_build_failed',
                 'Bot build failed. Will retry automatically.'
             );
@@ -1225,10 +1208,49 @@ async function triggerBotBuild(businessId) {
                 .eq('business_id', businessId);
         }
     } catch (e) {
-        console.error(`  [BotBuild] Error: ${e.message}`);
+        console.error(`  [Workers] InstructionsGenerator trigger error: ${e.message}`);
         await writeSyncStatus(businessId, 'bot_build_failed',
             'Bot build failed — network error. Will retry.'
         );
+    }
+}
+
+async function triggerProductsHandler(businessId, approvedMediaUrls = []) {
+    try {
+        const res = await fetch(`${PRODUCTS_HANDLER_URL}/process-images`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({
+                business_id:        businessId,
+                approved_media_urls: approvedMediaUrls   // pre-approved batch, skip re-querying
+            })
+        });
+
+        if (res.ok) {
+            console.log(`  [Workers] ✓ ProductsHandler triggered for ${businessId} (${approvedMediaUrls.length} images)`);
+        } else {
+            console.error(`  [Workers] ProductsHandler returned ${res.status}`);
+        }
+    } catch (e) {
+        console.error(`  [Workers] ProductsHandler trigger error: ${e.message}`);
+    }
+}
+
+async function triggerLeadsEnrichment(businessId) {
+    try {
+        const res = await fetch(`${LEADS_ENRICHMENT_URL}/enrich`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ business_id: businessId })
+        });
+
+        if (res.ok) {
+            console.log(`  [Workers] ✓ LeadsEnrichment triggered for ${businessId}`);
+        } else {
+            console.error(`  [Workers] LeadsEnrichment returned ${res.status}`);
+        }
+    } catch (e) {
+        console.error(`  [Workers] LeadsEnrichment trigger error: ${e.message}`);
     }
 }
 
@@ -1236,7 +1258,7 @@ async function triggerBotBuild(businessId) {
 // SECTION 16 — EXPRESS ROUTES
 // ============================================================
 
-// ── Webhook from Evolution Go ─────────────────────────────────
+// ── Webhook from Evolution API ────────────────────────────────
 app.post('/webhook/evolution', async (req, res) => {
     const businessId     = req.query.business_id;
     const sasaBusinessId = req.query.sasa_business_id;
@@ -1244,7 +1266,7 @@ app.post('/webhook/evolution', async (req, res) => {
 
     if (!businessId) return res.status(400).json({ error: 'Missing business_id query param' });
 
-    res.status(200).send('OK');  // Always ack immediately
+    res.status(200).send('OK');  // Always ack immediately — Evolution retries on non-200
 
     console.log(`\n[Webhook] event:${eventType} | business:${businessId}`);
 
@@ -1272,32 +1294,28 @@ app.post('/webhook/evolution', async (req, res) => {
     }
 });
 
-// ── Lead top-up (slider → activate MORE leads beyond auto-30) ─
+// ── Lead activation (slider → activate MORE leads beyond auto-30) ─
 //
-// Request body: { business_id, count }
-//   count = TOTAL leads the user wants activated (e.g. 1500)
-//
-// Logic:
-//   already_activated = auto_activated + user_activated_so_far
-//   delta = count - already_activated
+// Body: { business_id, count }
+//   count = TOTAL leads desired (e.g. 1500)
+//   delta = count - (auto_activated + user_activated_so_far)
 //   → charge only the delta
 //   → update leads_user_activated_count and leads_processed
 //
-// Returns 400 if delta <= 0 (already at or above requested count)
-// Returns 402 if insufficient balance for the delta
-// ──────────────────────────────────────────────────────────────
+// Returns 400 if delta <= 0
+// Returns 402 if insufficient balance
+// ─────────────────────────────────────────────────────────────────
 app.post('/leads/activate', async (req, res) => {
     const { business_id, count } = req.body;
-    if (!business_id)       return res.status(400).json({ error: 'business_id required' });
+    if (!business_id)        return res.status(400).json({ error: 'business_id required' });
     if (!count || count < 1) return res.status(400).json({ error: 'count must be >= 1' });
 
     try {
-        const onboarding = await getOnboardingRow(business_id);
+        const onboarding    = await getOnboardingRow(business_id);
         const autoActivated = onboarding.leads_auto_activated_count || 0;
         const userActivated = onboarding.leads_user_activated_count || 0;
         const alreadyTotal  = autoActivated + userActivated;
-
-        const delta = count - alreadyTotal;
+        const delta         = count - alreadyTotal;
 
         if (delta <= 0) {
             return res.status(400).json({
@@ -1332,15 +1350,20 @@ app.post('/leads/activate', async (req, res) => {
             leads_user_activated_count: newUserActivated,
             leads_processed:            newTotal,
             sync_status: {
-                stage:              'leads_activated',
-                message:            `${newTotal} leads now activated (${delta} added just now).`,
-                total_activated:    newTotal,
-                auto_activated:     autoActivated,
-                user_activated:     newUserActivated,
-                last_charged_kes:   totalKes,
-                updated_at:         new Date().toISOString()
+                stage:           'leads_activated',
+                message:         `${newTotal} leads now activated (${delta} added just now).`,
+                total_activated: newTotal,
+                auto_activated:  autoActivated,
+                user_activated:  newUserActivated,
+                last_charged_kes: totalKes,
+                updated_at:      new Date().toISOString()
             }
         });
+
+        // Re-fire LeadsEnrichment for the expanded set — non-blocking
+        triggerLeadsEnrichment(business_id).catch(e =>
+            console.error('[LeadActivate] LeadsEnrichment re-trigger error:', e.message)
+        );
 
         console.log(`  [LeadActivate] ✓ +${delta} leads for ${business_id} (total: ${newTotal}), charged ${totalKes} KES`);
 
@@ -1360,9 +1383,9 @@ app.post('/leads/activate', async (req, res) => {
 
 // ── Product image approval (user manually approves pending images) ─
 //
-// Request body: { business_id }
-// Approves all pending_approval images for this business.
-// Updates products_seeded = true so System 1 picks them up.
+// Body: { business_id }
+// Approves all pending_approval images.
+// Sets products_seeded = true so ProductsHandler picks them up.
 // ──────────────────────────────────────────────────────────────────
 app.post('/products/approve-discovery', async (req, res) => {
     const { business_id } = req.body;
@@ -1376,7 +1399,7 @@ app.post('/products/approve-discovery', async (req, res) => {
             .update({ status: 'approved', approved_at: now })
             .eq('business_id', business_id)
             .eq('status', 'pending_approval')
-            .select('id');
+            .select('id, media_url');
 
         if (error) throw error;
 
@@ -1400,6 +1423,14 @@ app.post('/products/approve-discovery', async (req, res) => {
             }
         });
 
+        // Fire ProductsHandler with the newly approved URLs
+        const approvedUrls = (approved || []).map(r => r.media_url).filter(Boolean);
+        if (approvedUrls.length > 0) {
+            triggerProductsHandler(business_id, approvedUrls).catch(e =>
+                console.error('[ProductApproval] ProductsHandler trigger error:', e.message)
+            );
+        }
+
         res.json({ ok: true, approved_count: approvedCount, total_approved: newTotal });
 
     } catch (e) {
@@ -1410,10 +1441,15 @@ app.post('/products/approve-discovery', async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
-    status:  'ok',
-    service: 'whatsapp-cleaner-v4',
-    version: '4.0.0'
+    status:   'ok',
+    service:  'evolution-cleaner',
+    version:  '4.0.0',
+    workers: {
+        instructions: INSTRUCTIONS_URL,
+        products:     PRODUCTS_HANDLER_URL,
+        enrichment:   LEADS_ENRICHMENT_URL
+    }
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WhatsApp Cleaner v4 online — port ${PORT}`));
+app.listen(PORT, () => console.log(`EvolutionCleaner v4 online — port ${PORT}`));
