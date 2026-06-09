@@ -390,57 +390,34 @@ async function recordAdAttribution(businessId, contactId, adData) {
 // ============================================================
 // SECTION 7 — LEAD CLASSIFICATION
 // ============================================================
+// The cleaner ONLY classifies leads if there is 100% structural certainty.
+// Dynamic conversation text is left as 'pending_analysis' so that the 
+// Enrichment Worker can accurately classify it without causing frontend deletion bugs.
+// ============================================================
 
 function classifyLeadType(firstMessageText, hasAdAttribution) {
+    // Rule 1: If it brought ad attribution data, it is definitively a business interaction
     if (hasAdAttribution) return 'business';
-    if (!firstMessageText) return 'unknown';
+    
+    if (!firstMessageText) return 'pending_analysis';
     const text = firstMessageText.toLowerCase().trim();
 
-    const businessPatterns = [
-        /\bprice\b|\bbei\b|\bgharr?ama\b/,
-        /\border\b|\bnunua\b|\bniambie\b/,
-        /\bavailable\b|\bstock\b|\bipo\b|\bkuna\b/,
-        /\bdelivery\b|\bntumie\b/,
-        /\bbulk\b|\bwholesale\b|\bjumla\b/,
-        /\bquotation\b|\bquote\b|\binvoice\b/,
-        /\bproduct\b|\bbidhaa\b/,
-        /\bhow much\b|\bnikupatie\b/,
-        /\bdo you sell\b|\bdo you have\b|\bmnauza\b/,
+    // Rule 2: Check for structural click-to-whatsapp ad text pre-fills (common in Meta ads)
+    // E.g., "I saw this on Instagram...", "Please send more details about..."
+    const adPrefillPatterns = [
+        /i saw this on/i,
+        /saw this product/i,
+        /mnauza hii/i,
+        /nimeona hii/i,
+        /tuma picha/i
     ];
-    const personalPatterns = [
-        /^(hi|hey|hello|hii|habari|mambo|niaje|sasa|vipi|u good|what'?s up)[\s!?.,]*$/,
-        /\bbro\b|\bsis\b|\bdude\b|\bfam\b/,
-    ];
-
-    for (const p of businessPatterns) if (p.test(text)) return 'business';
-    for (const p of personalPatterns) if (p.test(text)) return 'personal';
-    return 'unknown';
-}
-
-function extractProductInterests(adData, firstMessageText) {
-    const interests = [];
-    const sources   = [adData?.ad_headline || '', adData?.ad_body || '', firstMessageText || ''].join(' ').toLowerCase();
-    if (!sources.trim()) return interests;
-
-    const signals = [
-        { pattern: /solar|panel|inverter|battery/,   tag: 'solar_energy'       },
-        { pattern: /rent|apartment|house|plot|land/,  tag: 'real_estate'        },
-        { pattern: /car|vehicle|truck|motorbike/,     tag: 'automotive'         },
-        { pattern: /phone|laptop|computer|tablet/,    tag: 'electronics'        },
-        { pattern: /insurance|cover|policy|bima/,     tag: 'insurance'          },
-        { pattern: /loan|credit|mkopo|finance/,       tag: 'financial_services' },
-        { pattern: /school|college|course|training/,  tag: 'education'          },
-        { pattern: /clinic|hospital|doctor|dawa/,     tag: 'healthcare'         },
-        { pattern: /food|catering|cake|meal/,         tag: 'food_beverage'      },
-        { pattern: /clothes|dress|fashion|shoes/,     tag: 'fashion_apparel'    },
-        { pattern: /salon|barber|beauty|spa|nails/,   tag: 'beauty_wellness'    },
-        { pattern: /software|app|website|system/,     tag: 'software_tech'      },
-    ];
-
-    for (const { pattern, tag } of signals) {
-        if (pattern.test(sources) && !interests.includes(tag)) interests.push(tag);
+    for (const p of adPrefillPatterns) {
+        if (p.test(text)) return 'business';
     }
-    return interests;
+
+    // Rule 3: No structural certainty? Leave it for the Enrichment Worker to figure out.
+    // DO NOT label as 'personal' or 'unknown' here to protect frontend filters.
+    return 'pending_analysis';
 }
 
 // ============================================================
@@ -680,7 +657,7 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         name:            c.name || c.notify || c.verifiedName || 'Unknown',
         phone:           extractPhone(c.id),
         lead_state:      'new',
-        lead_type:       'unknown',
+        lead_type:       'pending_analysis',
         is_ad_lead:      false
     }));
 
