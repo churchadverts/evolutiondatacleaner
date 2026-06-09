@@ -390,34 +390,31 @@ async function recordAdAttribution(businessId, contactId, adData) {
 // ============================================================
 // SECTION 7 — LEAD CLASSIFICATION
 // ============================================================
-// The cleaner ONLY classifies leads if there is 100% structural certainty.
-// Dynamic conversation text is left as 'pending_analysis' so that the 
-// Enrichment Worker can accurately classify it without causing frontend deletion bugs.
-// ============================================================
 
 function classifyLeadType(firstMessageText, hasAdAttribution) {
-    // Rule 1: If it brought ad attribution data, it is definitively a business interaction
     if (hasAdAttribution) return 'business';
-    
-    if (!firstMessageText) return 'pending_analysis';
+    if (!firstMessageText) return 'unknown';
     const text = firstMessageText.toLowerCase().trim();
 
-    // Rule 2: Check for structural click-to-whatsapp ad text pre-fills (common in Meta ads)
-    // E.g., "I saw this on Instagram...", "Please send more details about..."
-    const adPrefillPatterns = [
-        /i saw this on/i,
-        /saw this product/i,
-        /mnauza hii/i,
-        /nimeona hii/i,
-        /tuma picha/i
+    const businessPatterns = [
+        /\bprice\b|\bbei\b|\bgharr?ama\b/,
+        /\border\b|\bnunua\b|\bniambie\b/,
+        /\bavailable\b|\bstock\b|\bipo\b|\bkuna\b/,
+        /\bdelivery\b|\bntumie\b/,
+        /\bbulk\b|\bwholesale\b|\bjumla\b/,
+        /\bquotation\b|\bquote\b|\binvoice\b/,
+        /\bproduct\b|\bbidhaa\b/,
+        /\bhow much\b|\bnikupatie\b/,
+        /\bdo you sell\b|\bdo you have\b|\bmnauza\b/,
     ];
-    for (const p of adPrefillPatterns) {
-        if (p.test(text)) return 'business';
-    }
+    const personalPatterns = [
+        /^(hi|hey|hello|hii|habari|mambo|niaje|sasa|vipi|u good|what'?s up)[\s!?.,]*$/,
+        /\bbro\b|\bsis\b|\bdude\b|\bfam\b/,
+    ];
 
-    // Rule 3: No structural certainty? Leave it for the Enrichment Worker to figure out.
-    // DO NOT label as 'personal' or 'unknown' here to protect frontend filters.
-    return 'pending_analysis';
+    for (const p of businessPatterns) if (p.test(text)) return 'business';
+    for (const p of personalPatterns) if (p.test(text)) return 'personal';
+    return 'unknown';
 }
 
 // ============================================================
@@ -459,6 +456,32 @@ async function getOrCreateContact(businessId, jid, pushName) {
         .single();
 
     if (error) throw new Error(`Contact create failed: ${error.message}`);
+
+    // ─── CHARGE INGESTION FEE FOR NEW LIVE LEAD ───
+    try {
+        const pricePerLead = await getBillingValue('lead_ingestion_min_kes', 0.75);
+        const charge = await chargeKes(businessId, pricePerLead, `Live lead ingestion — ${phone || jid}`);
+
+        if (!charge.ok && charge.reason === 'insufficient_funds') {
+            // Note the timestamp the balance went to zero if not already set
+            const { data: biz } = await supabase
+                .from('businesses')
+                .select('balance_zero_at')
+                .eq('business_id', businessId)
+                .single();
+
+            if (biz && !biz.balance_zero_at) {
+                await supabase
+                    .from('businesses')
+                    .update({ balance_zero_at: new Date().toISOString() })
+                    .eq('business_id', businessId);
+                console.log(`  [Billing] Business ${businessId} balance hit zero. Recorded timestamp.`);
+            }
+        }
+    } catch (billingErr) {
+        console.error(`  [Billing] Live ingestion charge logging failed: ${billingErr.message}`);
+    }
+
     return created;
 }
 
@@ -657,7 +680,7 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         name:            c.name || c.notify || c.verifiedName || 'Unknown',
         phone:           extractPhone(c.id),
         lead_state:      'new',
-        lead_type:       'pending_analysis',
+        lead_type:       'unknown',
         is_ad_lead:      false
     }));
 
@@ -785,7 +808,7 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         try {
             const adData      = extractAdAttribution(msg);
             const leadType    = classifyLeadType(content.text, !!adData);
-            const interests   = extractProductInterests(adData, content.text);
+            const interests   = []; // can extend product matching here
             const contactUpdate = { lead_type: leadType };
             if (interests.length > 0) contactUpdate.product_interests = interests;
             await supabase.from('contacts').update(contactUpdate).eq('id', contactId);
@@ -989,7 +1012,7 @@ async function processLiveMessage(payload, businessId) {
                 }
                 if (!contact.lead_type || contact.lead_type === 'unknown') {
                     const leadType  = classifyLeadType(content.text, !!adData);
-                    const interests = extractProductInterests(adData, content.text);
+                    const interests = []; // can extend product interests matching here
                     const update    = { lead_type: leadType };
                     if (interests.length > 0) update.product_interests = interests;
                     await supabase.from('contacts').update(update).eq('id', contactId);
@@ -1272,16 +1295,6 @@ app.post('/webhook/evolution', async (req, res) => {
 });
 
 // ── Lead activation (slider → activate MORE leads beyond auto-30) ─
-//
-// Body: { business_id, count }
-//   count = TOTAL leads desired (e.g. 1500)
-//   delta = count - (auto_activated + user_activated_so_far)
-//   → charge only the delta
-//   → update leads_user_activated_count and leads_processed
-//
-// Returns 400 if delta <= 0
-// Returns 402 if insufficient balance
-// ─────────────────────────────────────────────────────────────────
 app.post('/leads/activate', async (req, res) => {
     const { business_id, count } = req.body;
     if (!business_id)        return res.status(400).json({ error: 'business_id required' });
@@ -1359,11 +1372,6 @@ app.post('/leads/activate', async (req, res) => {
 });
 
 // ── Product image approval (user manually approves pending images) ─
-//
-// Body: { business_id }
-// Approves all pending_approval images.
-// Sets products_seeded = true so ProductsHandler picks them up.
-// ──────────────────────────────────────────────────────────────────
 app.post('/products/approve-discovery', async (req, res) => {
     const { business_id } = req.body;
     if (!business_id) return res.status(400).json({ error: 'business_id required' });
