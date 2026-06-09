@@ -1062,8 +1062,24 @@ async function processLiveMessage(payload, businessId) {
 // SECTION 13 — MESSAGE STATUS UPDATE HANDLER
 // ============================================================
 
+// ============================================================
+// SECTION 13 — MESSAGE STATUS UPDATE HANDLER
+// ============================================================
+
 async function processMessageStatusUpdate(payload, businessId) {
     try {
+        // Check if the business has a zero balance flag
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('balance_zero_at')
+            .eq('business_id', businessId)
+            .single();
+
+        if (biz?.balance_zero_at) {
+            console.log(`  [StatusUpdate] Business ${businessId} is out of credits. Skipping enrichment worker pipeline.`);
+            return;
+        }
+
         const response = await fetch(`${ENRICHMENT_WORKER_URL}/status-update`, {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1075,7 +1091,6 @@ async function processMessageStatusUpdate(payload, businessId) {
         console.error(`  [StatusUpdate] Failed to forward: ${e.message}`);
     }
 }
-
 // ============================================================
 // SECTION 14 — CONNECTION UPDATE HANDLER
 // ============================================================
@@ -1420,6 +1435,79 @@ app.post('/products/approve-discovery', async (req, res) => {
 
     } catch (e) {
         console.error('[ProductApproval] Error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Recharge Reconciliation (Triggered after a successful top-up) ─
+app.post('/billing/reconcile', async (req, res) => {
+    const { business_id } = req.body;
+    if (!business_id) return res.status(400).json({ error: 'business_id required' });
+
+    try {
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('balance_zero_at')
+            .eq('business_id', business_id)
+            .single();
+
+        if (!biz || !biz.balance_zero_at) {
+            return res.json({ ok: true, message: 'No reconciliation needed. Balance was not flagged as zero.' });
+        }
+
+        // Find contacts created during the zero balance window
+        const { data: contacts, error: contactErr } = await supabase
+            .from('contacts')
+            .select('id')
+            .eq('business_id', business_id)
+            .gte('created_at', biz.balance_zero_at);
+
+        if (contactErr) throw contactErr;
+
+        const count = contacts?.length || 0;
+        if (count === 0) {
+            await supabase.from('businesses').update({ balance_zero_at: null }).eq('business_id', business_id);
+            return res.json({ ok: true, message: 'No contacts found to reconcile. Reset flag.' });
+        }
+
+        const pricePerLead = await getBillingValue('lead_ingestion_min_kes', 0.75);
+        const totalKes     = count * pricePerLead;
+
+        const charge = await chargeKes(
+            business_id,
+            totalKes,
+            `Reconciliation catch-up — ${count} accumulated leads @ ${pricePerLead} KES each`
+        );
+
+        if (!charge.ok) {
+            return res.status(402).json({
+                error: 'insufficient_funds_during_reconcile',
+                message: `Reconciliation requires ${totalKes} KES for ${count} leads, but charge failed.`,
+                required_kes: totalKes,
+                reason: charge.reason
+            });
+        }
+
+        // Clear the zero balance flag since payment succeeded
+        await supabase
+            .from('businesses')
+            .update({ balance_zero_at: null })
+            .eq('business_id', business_id);
+
+        // Fire LeadsEnrichment to process all missed messages/leads
+        triggerLeadsEnrichment(business_id).catch(e =>
+            console.error('[Reconcile] LeadsEnrichment trigger error:', e.message)
+        );
+
+        res.json({
+            ok: true,
+            message: `Reconciliation successful. Charged for ${count} leads.`,
+            reconciled_leads: count,
+            charged_kes: totalKes
+        });
+
+    } catch (e) {
+        console.error('[Reconcile] Error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
