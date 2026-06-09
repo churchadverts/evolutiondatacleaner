@@ -31,13 +31,6 @@ const AUTO_APPROVE_PRODUCTS = 30;
 // ============================================================
 // SECTION 1 — BILLING CONFIG
 // ============================================================
-// Keys consumed from followup_billing_config:
-//   lead_ingestion_min_kes     — KES per activated lead (default 0.75)
-//   usd_to_kes_rate            — exchange rate          (default 130)
-//
-// Note: bot_build_cost_multiplier and bot_build_min_balance_usd
-// have been moved to instructions-generator — they only apply there.
-// ============================================================
 
 let _billingConfig   = null;
 let _billingConfigAt = 0;
@@ -65,14 +58,6 @@ async function getBillingValue(key, defaultValue) {
     return isNaN(num) ? defaultValue : num;
 }
 
-/**
- * Deduct KES from a business balance.
- * Converts KES → USD using the config rate, writes to business_balances.
- * Returns { ok, reason?, charged_kes?, charged_usd?, new_balance_usd? }
- *
- * This is the ONLY place in the cleaner that touches money.
- * Top-ups go through the billing edge function — never here.
- */
 async function chargeKes(businessId, amountKes, description) {
     try {
         const rate      = await getBillingValue('usd_to_kes_rate', 130);
@@ -107,25 +92,6 @@ async function chargeKes(businessId, amountKes, description) {
 // ============================================================
 // SECTION 2 — ONBOARDING PROGRESS WRITER
 // ============================================================
-// business_onboarding is the single source of truth the frontend polls.
-// This service owns ALL writes to sync_status.stage.
-// Workers write only their own count columns (e.g. products_auto_approved_count)
-// via direct Supabase calls — they never write sync_status.stage.
-//
-// Stage ownership:
-//   history_received           ← processHistorySync (phase 1)
-//   awaiting_lead_activation   ← processHistorySync (phase 1, after pre-scan)
-//   auto_activating            ← autoActivateLeads
-//   insufficient_funds_auto    ← autoActivateLeads (charge failed)
-//   leads_activated            ← autoActivateLeads (success) / /leads/activate
-//   bot_building               ← triggerInstructionsGenerator
-//   bot_build_failed           ← triggerInstructionsGenerator (on error)
-//   products_auto_approved     ← stageAndAutoApproveProductImages (first run)
-//   products_discovered        ← stageAndAutoApproveProductImages (pending only)
-//   products_approved          ← /products/approve-discovery
-//   connected                  ← processConnectionUpdate
-//   disconnected               ← processConnectionUpdate
-// ============================================================
 
 async function writeOnboardingProgress(businessId, fields) {
     try {
@@ -144,10 +110,6 @@ async function writeSyncStatus(businessId, stage, message, extra = {}) {
     await writeOnboardingProgress(businessId, { sync_status: payload });
 }
 
-/**
- * Read the current onboarding row.
- * Used as idempotency guard before auto-activation and product auto-approval.
- */
 async function getOnboardingRow(businessId) {
     const { data } = await supabase
         .from('business_onboarding')
@@ -221,13 +183,6 @@ function extractMessageContent(msg) {
 
 // ============================================================
 // SECTION 4 — PRE-SCAN
-// ============================================================
-// Runs BEFORE any DB work. O(n) pass over the raw messages array.
-// Extracts:
-//   - count of unique non-group inbound JIDs  → leads_total_found
-//   - count of unique outbound image JIDs      → products raw count
-// Count is written to onboarding immediately so the frontend
-// can render the slider before the full sync completes.
 // ============================================================
 
 function preScanPayload(payload) {
@@ -388,33 +343,38 @@ async function recordAdAttribution(businessId, contactId, adData) {
 }
 
 // ============================================================
-// SECTION 7 — LEAD CLASSIFICATION
+// SECTION 7 — LEAD CLASSIFICATION & PRODUCT EXTRACTION
 // ============================================================
 
 function classifyLeadType(firstMessageText, hasAdAttribution) {
     if (hasAdAttribution) return 'business';
-    if (!firstMessageText) return 'unknown';
+    if (!firstMessageText) return 'pending_analysis';
     const text = firstMessageText.toLowerCase().trim();
 
-    const businessPatterns = [
-        /\bprice\b|\bbei\b|\bgharr?ama\b/,
-        /\border\b|\bnunua\b|\bniambie\b/,
-        /\bavailable\b|\bstock\b|\bipo\b|\bkuna\b/,
-        /\bdelivery\b|\bntumie\b/,
-        /\bbulk\b|\bwholesale\b|\bjumla\b/,
-        /\bquotation\b|\bquote\b|\binvoice\b/,
-        /\bproduct\b|\bbidhaa\b/,
-        /\bhow much\b|\bnikupatie\b/,
-        /\bdo you sell\b|\bdo you have\b|\bmnauza\b/,
+    // Check for structural click-to-whatsapp ad text patterns
+    const adPrefillPatterns = [
+        /i saw this on/i,
+        /saw this product/i,
+        /mnauza hii/i,
+        /nimeona hii/i,
+        /tuma picha/i
     ];
-    const personalPatterns = [
-        /^(hi|hey|hello|hii|habari|mambo|niaje|sasa|vipi|u good|what'?s up)[\s!?.,]*$/,
-        /\bbro\b|\bsis\b|\bdude\b|\bfam\b/,
-    ];
+    for (const p of adPrefillPatterns) {
+        if (p.test(text)) return 'business';
+    }
 
-    for (const p of businessPatterns) if (p.test(text)) return 'business';
-    for (const p of personalPatterns) if (p.test(text)) return 'personal';
-    return 'unknown';
+    // Leave for the Enrichment worker slow loop to process contextually
+    return 'pending_analysis';
+}
+
+function extractProductInterests(adData, firstMessageText) {
+    const interests = [];
+    if (adData?.ad_headline) {
+        interests.push(adData.ad_headline.trim());
+    } else if (adData?.ad_body) {
+        interests.push(adData.ad_body.split(' ').slice(0, 5).join(' ') + '...');
+    }
+    return interests;
 }
 
 // ============================================================
@@ -447,7 +407,7 @@ async function getOrCreateContact(businessId, jid, pushName) {
             name:            pushName || 'Unknown',
             phone,
             lead_state:      'new',
-            lead_type:       'unknown',
+            lead_type:       'pending_analysis',
             is_ad_lead:      false,
             follow_up_count: 0,
             last_seen:       new Date().toISOString()
@@ -463,7 +423,6 @@ async function getOrCreateContact(businessId, jid, pushName) {
         const charge = await chargeKes(businessId, pricePerLead, `Live lead ingestion — ${phone || jid}`);
 
         if (!charge.ok && charge.reason === 'insufficient_funds') {
-            // Note the timestamp the balance went to zero if not already set
             const { data: biz } = await supabase
                 .from('businesses')
                 .select('balance_zero_at')
@@ -563,10 +522,6 @@ async function processConsentResponse(contactId, contentText) {
 // ============================================================
 // SECTION 9 — AUTO-ACTIVATION (first 30 leads)
 // ============================================================
-// Idempotency gate: reads leads_auto_activated_at from onboarding.
-// Charges KES, writes onboarding stage, then fires InstructionsGenerator.
-// Does NOT touch lead enrichment — that's LeadsEnrichment's job.
-// ============================================================
 
 async function autoActivateLeads(businessId, onboardingRow) {
     if (onboardingRow.leads_auto_activated_at) {
@@ -599,7 +554,6 @@ async function autoActivateLeads(businessId, onboardingRow) {
         return { ok: false, reason: charge.reason };
     }
 
-    // Write idempotency lock first
     await writeOnboardingProgress(businessId, {
         leads_auto_activated_count: AUTO_ACTIVATE_LEADS,
         leads_auto_activated_at:    new Date().toISOString(),
@@ -617,13 +571,10 @@ async function autoActivateLeads(businessId, onboardingRow) {
 
     console.log(`  [AutoActivate] ✓ ${AUTO_ACTIVATE_LEADS} leads activated, charged ${totalKes} KES`);
 
-    // Fire InstructionsGenerator (bot build) — non-blocking
     triggerInstructionsGenerator(businessId).catch(e =>
         console.error('[AutoActivate] InstructionsGenerator trigger error:', e.message)
     );
 
-    // Fire LeadsEnrichment — non-blocking
-    // Enrichment runs independently; it doesn't block the onboarding flow
     triggerLeadsEnrichment(businessId).catch(e =>
         console.error('[AutoActivate] LeadsEnrichment trigger error:', e.message)
     );
@@ -633,12 +584,6 @@ async function autoActivateLeads(businessId, onboardingRow) {
 
 // ============================================================
 // SECTION 10 — HISTORY SYNC
-// ============================================================
-// Phase 1 (pre-scan)   — O(n), no DB — writes leads_total_found immediately
-// Phase 2 (DB upserts) — contacts, conversations, messages in bulk
-// Phase 3 (classify)   — ad attribution + lead type per contact
-// Phase 4 (activate)   — charge + fire InstructionsGenerator + LeadsEnrichment
-// Phase 5 (products)   — stage images + fire ProductsHandler
 // ============================================================
 
 async function processHistorySync(payload, businessId, sasaBusinessId) {
@@ -651,7 +596,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 
     const onboardingRow = await getOnboardingRow(businessId);
 
-    // ── Phase 1: Pre-scan — write count before any DB work ─────
     await writeSyncStatus(businessId, 'history_received',
         `Received your WhatsApp history. Counting contacts...`
     );
@@ -671,7 +615,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 
     console.log(`  [History] Pre-scan: ${preScan.leadsFound} leads, ${preScan.outboundImageCount} product images`);
 
-    // ── Phase 2: Contacts upsert ────────────────────────────────
     const validContacts   = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
     const contactPayloads = validContacts.map(c => ({
         business_id:     businessId,
@@ -680,7 +623,7 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         name:            c.name || c.notify || c.verifiedName || 'Unknown',
         phone:           extractPhone(c.id),
         lead_state:      'new',
-        lead_type:       'unknown',
+        lead_type:       'pending_analysis',
         is_ad_lead:      false
     }));
 
@@ -699,7 +642,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         console.log(`  [History] ${stats.contacts} contacts upserted`);
     }
 
-    // ── Phase 2b: Conversations upsert ─────────────────────────
     const validChats           = chats.filter(c => c.id && !isGroupOrBroadcast(c.id));
     const conversationPayloads = validChats
         .map(chat => ({
@@ -726,7 +668,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         stats.conversations = inserted.length;
     }
 
-    // ── Phase 2c: Messages upsert ───────────────────────────────
     const cutoffTs        = Math.floor(Date.now() / 1000) - (HISTORY_DAYS * 24 * 60 * 60);
     const convLastMsg     = {};
     const convLastInbound = {};
@@ -799,7 +740,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
     }
     console.log(`  [History] ${stats.messages} messages upserted, ${stats.skipped} skipped`);
 
-    // ── Phase 3: Classify leads + ad attribution ────────────────
     await writeSyncStatus(businessId, 'classifying_leads',
         `Classifying ${Object.keys(contactFirstMsg).length} leads...`
     );
@@ -808,7 +748,7 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         try {
             const adData      = extractAdAttribution(msg);
             const leadType    = classifyLeadType(content.text, !!adData);
-            const interests   = []; // can extend product matching here
+            const interests   = extractProductInterests(adData, content.text);
             const contactUpdate = { lead_type: leadType };
             if (interests.length > 0) contactUpdate.product_interests = interests;
             await supabase.from('contacts').update(contactUpdate).eq('id', contactId);
@@ -818,7 +758,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         }
     }
 
-    // ── Phase 3b: Update conversation metadata ──────────────────
     for (const [convId, data] of Object.entries(convLastMsg)) {
         const fields = { last_message_preview: data.preview };
         if (convLastInbound[convId]) {
@@ -827,11 +766,8 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
         await supabase.from('conversations').update(fields).eq('id', convId);
     }
 
-    // ── Phase 4: Auto-activate + fire workers ───────────────────
-    // autoActivateLeads internally fires InstructionsGenerator + LeadsEnrichment
     await autoActivateLeads(businessId, onboardingRow);
 
-    // ── Phase 5: Stage product images + fire ProductsHandler ────
     if (outboundImages.length > 0) {
         await stageAndAutoApproveProductImages(businessId, outboundImages, onboardingRow);
     }
@@ -842,14 +778,6 @@ async function processHistorySync(payload, businessId, sasaBusinessId) {
 
 // ============================================================
 // SECTION 11 — PRODUCT IMAGE STAGING
-// ============================================================
-// Responsibility: write product_image_staging rows and update onboarding counts.
-// Does NOT download images or call OpenAI — that's ProductsHandler's job.
-//
-// After staging, fires ProductsHandler non-blocking with the list of
-// approved media_urls. ProductsHandler does the download → vision → products insert.
-//
-// Idempotency gate: products_auto_approved_count > 0 means first run already happened.
 // ============================================================
 
 async function stageAndAutoApproveProductImages(businessId, imageMessages, onboardingRow) {
@@ -940,8 +868,6 @@ async function stageAndAutoApproveProductImages(businessId, imageMessages, onboa
                 }
             });
 
-            // Fire ProductsHandler for the approved batch — non-blocking
-            // Pass the approved media_urls so it doesn't need to re-query
             const approvedUrls = toAutoApprove
                 .map(msg => msg.message?.imageMessage?.url)
                 .filter(Boolean);
@@ -1010,9 +936,9 @@ async function processLiveMessage(payload, businessId) {
                 } else if (contact.ad_attribution_id) {
                     adAttributionId = contact.ad_attribution_id;
                 }
-                if (!contact.lead_type || contact.lead_type === 'unknown') {
+                if (!contact.lead_type || contact.lead_type === 'pending_analysis' || contact.lead_type === 'unknown') {
                     const leadType  = classifyLeadType(content.text, !!adData);
-                    const interests = []; // can extend product interests matching here
+                    const interests = extractProductInterests(adData, content.text);
                     const update    = { lead_type: leadType };
                     if (interests.length > 0) update.product_interests = interests;
                     await supabase.from('contacts').update(update).eq('id', contactId);
@@ -1059,16 +985,11 @@ async function processLiveMessage(payload, businessId) {
 }
 
 // ============================================================
-// SECTION 13 — MESSAGE STATUS UPDATE HANDLER
-// ============================================================
-
-// ============================================================
-// SECTION 13 — MESSAGE STATUS UPDATE HANDLER
+// SECTION 13 — MESSAGE STATUS UPDATE HANDLER (WITH CREDIT GUARD)
 // ============================================================
 
 async function processMessageStatusUpdate(payload, businessId) {
     try {
-        // Check if the business has a zero balance flag
         const { data: biz } = await supabase
             .from('businesses')
             .select('balance_zero_at')
@@ -1076,7 +997,7 @@ async function processMessageStatusUpdate(payload, businessId) {
             .single();
 
         if (biz?.balance_zero_at) {
-            console.log(`  [StatusUpdate] Business ${businessId} is out of credits. Skipping enrichment worker pipeline.`);
+            console.log(`  [StatusUpdate] Business ${businessId} is out of credits. Skipping enrichment worker pipeline forward.`);
             return;
         }
 
@@ -1091,6 +1012,7 @@ async function processMessageStatusUpdate(payload, businessId) {
         console.error(`  [StatusUpdate] Failed to forward: ${e.message}`);
     }
 }
+
 // ============================================================
 // SECTION 14 — CONNECTION UPDATE HANDLER
 // ============================================================
@@ -1177,14 +1099,6 @@ async function processConnectionUpdate(payload, businessId) {
 // ============================================================
 // SECTION 15 — WORKER TRIGGERS
 // ============================================================
-// All three workers are fired non-blocking (fire-and-forget HTTP POST).
-// The cleaner does not await their completion — it just fires and moves on.
-// Each worker is responsible for its own error handling and status writes.
-//
-// InstructionsGenerator: builds persona pack (voice + context + customer analysis)
-// ProductsHandler:       downloads images, runs vision, inserts into products table
-// LeadsEnrichment:       enriches contacts with intent, quality score, lead type
-// ============================================================
 
 async function triggerInstructionsGenerator(businessId) {
     try {
@@ -1237,7 +1151,7 @@ async function triggerProductsHandler(businessId, approvedMediaUrls = []) {
             headers: { 'Content-Type': 'application/json' },
             body:    JSON.stringify({
                 business_id:        businessId,
-                approved_media_urls: approvedMediaUrls   // pre-approved batch, skip re-querying
+                approved_media_urls: approvedMediaUrls
             })
         });
 
@@ -1273,7 +1187,6 @@ async function triggerLeadsEnrichment(businessId) {
 // SECTION 16 — EXPRESS ROUTES
 // ============================================================
 
-// ── Webhook from Evolution API ────────────────────────────────
 app.post('/webhook/evolution', async (req, res) => {
     const businessId     = req.query.business_id;
     const sasaBusinessId = req.query.sasa_business_id;
@@ -1281,7 +1194,7 @@ app.post('/webhook/evolution', async (req, res) => {
 
     if (!businessId) return res.status(400).json({ error: 'Missing business_id query param' });
 
-    res.status(200).send('OK');  // Always ack immediately — Evolution retries on non-200
+    res.status(200).send('OK');
 
     console.log(`\n[Webhook] event:${eventType} | business:${businessId}`);
 
@@ -1309,7 +1222,6 @@ app.post('/webhook/evolution', async (req, res) => {
     }
 });
 
-// ── Lead activation (slider → activate MORE leads beyond auto-30) ─
 app.post('/leads/activate', async (req, res) => {
     const { business_id, count } = req.body;
     if (!business_id)        return res.status(400).json({ error: 'business_id required' });
@@ -1365,7 +1277,6 @@ app.post('/leads/activate', async (req, res) => {
             }
         });
 
-        // Re-fire LeadsEnrichment for the expanded set — non-blocking
         triggerLeadsEnrichment(business_id).catch(e =>
             console.error('[LeadActivate] LeadsEnrichment re-trigger error:', e.message)
         );
@@ -1386,7 +1297,6 @@ app.post('/leads/activate', async (req, res) => {
     }
 });
 
-// ── Product image approval (user manually approves pending images) ─
 app.post('/products/approve-discovery', async (req, res) => {
     const { business_id } = req.body;
     if (!business_id) return res.status(400).json({ error: 'business_id required' });
@@ -1423,7 +1333,6 @@ app.post('/products/approve-discovery', async (req, res) => {
             }
         });
 
-        // Fire ProductsHandler with the newly approved URLs
         const approvedUrls = (approved || []).map(r => r.media_url).filter(Boolean);
         if (approvedUrls.length > 0) {
             triggerProductsHandler(business_id, approvedUrls).catch(e =>
@@ -1439,7 +1348,7 @@ app.post('/products/approve-discovery', async (req, res) => {
     }
 });
 
-// ── Recharge Reconciliation (Triggered after a successful top-up) ─
+// ── RECHARGE CATCH-UP RECONCILIATION ROUTE ───────────────────
 app.post('/billing/reconcile', async (req, res) => {
     const { business_id } = req.body;
     if (!business_id) return res.status(400).json({ error: 'business_id required' });
@@ -1455,7 +1364,6 @@ app.post('/billing/reconcile', async (req, res) => {
             return res.json({ ok: true, message: 'No reconciliation needed. Balance was not flagged as zero.' });
         }
 
-        // Find contacts created during the zero balance window
         const { data: contacts, error: contactErr } = await supabase
             .from('contacts')
             .select('id')
@@ -1488,13 +1396,11 @@ app.post('/billing/reconcile', async (req, res) => {
             });
         }
 
-        // Clear the zero balance flag since payment succeeded
         await supabase
             .from('businesses')
             .update({ balance_zero_at: null })
             .eq('business_id', business_id);
 
-        // Fire LeadsEnrichment to process all missed messages/leads
         triggerLeadsEnrichment(business_id).catch(e =>
             console.error('[Reconcile] LeadsEnrichment trigger error:', e.message)
         );
@@ -1512,11 +1418,10 @@ app.post('/billing/reconcile', async (req, res) => {
     }
 });
 
-// ── Health check ──────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
     status:   'ok',
     service:  'evolution-cleaner',
-    version:  '4.0.0',
+    version:  '4.1.0',
     workers: {
         instructions: INSTRUCTIONS_URL,
         products:     PRODUCTS_HANDLER_URL,
@@ -1525,4 +1430,4 @@ app.get('/health', (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EvolutionCleaner v4 online — port ${PORT}`));
+app.listen(PORT, () => console.log(`EvolutionCleaner v4.1 online — port ${PORT}`));
